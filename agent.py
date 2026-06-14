@@ -1,20 +1,106 @@
-from google import genai
-from tools import search_location, get_ride_coords
+import os
+import requests
 from models import ChatResponse, LocationResult
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 
+# In-memory session store
 sessions = {}
+
+# Keep Render alive
+import threading
+import time
+
+def keep_alive():
+    while True:
+        time.sleep(840)
+        try:
+            requests.get("https://rapidoautomation.onrender.com/health", timeout=5)
+        except:
+            pass
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+# ── Intent parsing (no LLM, pure keyword matching) ──────────────────────────
+
+RIDE_KEYWORDS = {
+    "Bike Direct": ["bike", "bike direct", "byke", "byk", "motorbike", "motorcycle"],
+    "Scooty Direct": ["scooty", "scooter", "scooti", "scoty"],
+    "Auto": ["auto", "autorickshaw", "auto rickshaw", "rick", "tuk"],
+}
+
+CONFIRM_KEYWORDS = ["yes", "yeah", "yep", "yup", "correct", "right", "confirm", "ok", "okay", "sure", "book", "proceed", "go ahead", "haan", "ha"]
+REJECT_KEYWORDS = ["no", "nope", "wrong", "nahi", "cancel", "stop", "not", "different", "change"]
+
+def extract_ride_type(text: str) -> str | None:
+    text = text.lower().strip()
+    for ride_type, keywords in RIDE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                return ride_type
+    return None
+
+def is_confirmation(text: str) -> bool:
+    text = text.lower().strip()
+    for kw in CONFIRM_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+def is_rejection(text: str) -> bool:
+    text = text.lower().strip()
+    for kw in REJECT_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+# ── Google Places search ─────────────────────────────────────────────────────
+
+def search_location(query: str) -> list:
+    try:
+        url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+        params = {
+            "query": f"{query} Bengaluru",
+            "key": GOOGLE_PLACES_KEY,
+            "region": "in",
+            "language": "en",
+        }
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+
+        results = []
+        for item in data.get("results", [])[:3]:
+            name = item.get("name", "")
+            address = item.get("formatted_address", "")
+            lat = item["geometry"]["location"]["lat"]
+            lng = item["geometry"]["location"]["lng"]
+            results.append({
+                "name": name,
+                "full_address": f"{name}, {address}",
+                "lat": lat,
+                "lng": lng,
+            })
+        return results
+    except Exception as e:
+        return []
+
+# ── Rapido ride coordinates ──────────────────────────────────────────────────
+
+RAPIDO_RIDE_COORDS = {
+    "Bike Direct": {"x": 540, "y": 1247},
+    "Scooty Direct": {"x": 540, "y": 1450},
+    "Auto": {"x": 540, "y": 1822},
+}
+
+# ── Session management ───────────────────────────────────────────────────────
 
 def get_session(session_id: str) -> dict:
     if session_id not in sessions:
         sessions[session_id] = {
             "step": "asking_destination",
-            "destination": None,
             "locations": [],
             "selected_location": None,
             "ride_type": None,
@@ -22,95 +108,58 @@ def get_session(session_id: str) -> dict:
     return sessions[session_id]
 
 def clear_session(session_id: str):
-    if session_id in sessions:
-        del sessions[session_id]
+    sessions.pop(session_id, None)
 
-def ask_gemini(system: str, user: str) -> str:
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=f"{system}\n\nUser: {user}",
-    )
-    return response.text.strip()
-
-def extract_destination(user_message: str) -> str:
-    return ask_gemini(
-        """You extract destination names from natural speech for a ride booking app in Bengaluru.
-Extract only the destination name/place. Return ONLY the place name, nothing else.
-Examples:
-- "take me to NMIT" → "NMIT"
-- "I want to go to Koramangala 5th block" → "Koramangala 5th block"
-- "drop me at Hebbal flyover" → "Hebbal flyover"
-- "college" → "Dayananda Sagar College of Engineering"
-- "home" → "Nobel Residency Phase 2 Tejaswini Nagar Bengaluru" """,
-        user_message,
-    )
-
-def extract_ride_type(user_message: str) -> str:
-    return ask_gemini(
-        """You extract ride type from natural speech for Rapido booking.
-Return ONLY one of these exact values: "Bike Direct", "Scooty Direct", "Auto"
-Examples:
-- "bike" → "Bike Direct"
-- "scooty" → "Scooty Direct"
-- "auto" → "Auto"
-- "I'll take the bike" → "Bike Direct"
-- "get me an auto" → "Auto" """,
-        user_message,
-    )
-
-def is_confirmation(user_message: str) -> bool:
-    result = ask_gemini(
-        "Return only 'yes' or 'no' based on whether the user is confirming. Any positive response = yes.",
-        user_message,
-    )
-    return result.lower().startswith("yes")
+# ── Main conversation handler ────────────────────────────────────────────────
 
 def process_message(session_id: str, user_message: str) -> ChatResponse:
     session = get_session(session_id)
     step = session["step"]
+    text = user_message.lower().strip()
 
+    # ── Step 1: User says where they want to go ──
     if step == "asking_destination":
-        destination = extract_destination(user_message)
-        locations = search_location(destination)
+        locations = search_location(user_message)
 
         if not locations:
             return ChatResponse(
-                message=f"Sorry, I couldn't find '{destination}' in Bengaluru. Please try again.",
+                message=f"Sorry, I couldn't find that location in Bengaluru. Please try again.",
                 next_step="asking_destination",
             )
 
-        session["destination"] = destination
         session["locations"] = locations
         session["step"] = "confirming_destination"
 
         top = locations[0]
+        from models import LocationResult
         location_results = [LocationResult(**loc) for loc in locations]
 
         return ChatResponse(
-            message=f"I found: {top['full_address']}. Is this correct?",
+            message=f"I found {top['name']}. Address: {top['full_address']}. Is this correct?",
             next_step="confirming_destination",
             locations=location_results,
             selected_location=LocationResult(**top),
         )
 
+    # ── Step 2: User confirms or rejects location ──
     elif step == "confirming_destination":
-        confirmed = is_confirmation(user_message)
-
-        if confirmed:
+        if is_confirmation(text):
             session["selected_location"] = session["locations"][0]
             session["step"] = "asking_ride_type"
+            from models import LocationResult
             return ChatResponse(
-                message="Great! Which ride type do you want? Say Bike, Scooty, or Auto.",
+                message="Great! Which ride do you want? Say Bike, Scooty, or Auto.",
                 next_step="asking_ride_type",
                 selected_location=LocationResult(**session["selected_location"]),
             )
-        else:
+        elif is_rejection(text):
             if len(session["locations"]) > 1:
                 session["locations"].pop(0)
                 top = session["locations"][0]
+                from models import LocationResult
                 location_results = [LocationResult(**loc) for loc in session["locations"]]
                 return ChatResponse(
-                    message=f"How about: {top['full_address']}. Is this correct?",
+                    message=f"How about {top['name']}? Address: {top['full_address']}. Is this correct?",
                     next_step="confirming_destination",
                     locations=location_results,
                     selected_location=LocationResult(**top),
@@ -121,39 +170,58 @@ def process_message(session_id: str, user_message: str) -> ChatResponse:
                     message="No more results. Please say your destination again.",
                     next_step="asking_destination",
                 )
+        else:
+            return ChatResponse(
+                message="Please say Yes to confirm or No to try another result.",
+                next_step="confirming_destination",
+            )
 
+    # ── Step 3: User picks ride type ──
     elif step == "asking_ride_type":
-        ride_type = extract_ride_type(user_message)
+        ride_type = extract_ride_type(text)
+        if not ride_type:
+            return ChatResponse(
+                message="I didn't catch that. Please say Bike, Scooty, or Auto.",
+                next_step="asking_ride_type",
+            )
+
         session["ride_type"] = ride_type
         session["step"] = "confirming_booking"
-
         loc = session["selected_location"]
+        from models import LocationResult
         return ChatResponse(
-            message=f"Booking {ride_type} to {loc['full_address']}. Say Yes to confirm or No to cancel.",
+            message=f"Booking {ride_type} to {loc['name']}. Say Yes to confirm or No to cancel.",
             next_step="confirming_booking",
             ride_type=ride_type,
             selected_location=LocationResult(**loc),
         )
 
+    # ── Step 4: Final confirmation ──
     elif step == "confirming_booking":
-        confirmed = is_confirmation(user_message)
-
-        if confirmed:
-            coords = get_ride_coords(session["ride_type"])
+        if is_confirmation(text):
+            coords = RAPIDO_RIDE_COORDS[session["ride_type"]]
             ride = session["ride_type"]
+            loc = session["selected_location"]
             clear_session(session_id)
+            from models import LocationResult
             return ChatResponse(
-                message="Booking your ride now!",
+                message=f"Booking your {ride} now!",
                 next_step="booking",
                 ride_type=ride,
                 ride_coords=coords,
                 ready_to_book=True,
+                selected_location=LocationResult(**loc),
             )
-        else:
+        elif is_rejection(text):
             clear_session(session_id)
             return ChatResponse(
                 message="Booking cancelled. Tap the mic to start again.",
                 next_step="idle",
+            )
+        else:
+            return ChatResponse(
+                message="Please say Yes to book or No to cancel.",
+                next_step="confirming_booking",
             )
 
     return ChatResponse(
