@@ -3,3 +3,5 @@ uvicorn
 python-dotenv
 requests
 pydantic
+
+curl "https://maps.googleapis.com/maps/api/place/textsearch/json?query=NMIT+Yelahanka+Bengaluru&key=AIzaSyBCeuczhLB4koU9yHnNd9B8pmRcU9WTX7g"

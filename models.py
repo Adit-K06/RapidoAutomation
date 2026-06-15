@@ -9,6 +9,7 @@ class ChatRequest(BaseModel):
 class LocationResult(BaseModel):
     name: str
     full_address: str
+    short_address: str = ""
     lat: float
     lng: float
 
