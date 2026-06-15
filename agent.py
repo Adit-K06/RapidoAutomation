@@ -31,9 +31,12 @@ CONFIRM_KEYWORDS = [
     "yes", "yeah", "yep", "yup", "correct", "right", "confirm",
     "ok", "okay", "sure", "book", "proceed", "go ahead", "haan", "ha",
 ]
+
 REJECT_KEYWORDS = [
-    "no", "nope", "wrong", "nahi", "cancel", "stop",
-    "not", "different", "change",
+    "no", "nope", "wrong", "nahi", "cancel", "stop", "not", "different",
+    "change", "none", "cancel the ride", "stop the ride", "don't book",
+    "do not book", "abort", "quit", "exit", "nevermind", "never mind",
+    "forget it", "leave it", "band kar", "mat karo",
 ]
 
 def extract_ride_type(text: str):
@@ -46,6 +49,8 @@ def extract_ride_type(text: str):
 
 def is_confirmation(text: str) -> bool:
     text = text.lower().strip()
+    if is_rejection(text):
+        return False
     return any(kw in text for kw in CONFIRM_KEYWORDS)
 
 def is_rejection(text: str) -> bool:
@@ -108,9 +113,16 @@ def process_message(session_id: str, user_message: str) -> ChatResponse:
     step = session["step"]
     text = user_message.lower().strip()
 
+    # Global cancel — works at any step
+    if is_rejection(text) and step != "asking_destination":
+        clear_session(session_id)
+        return ChatResponse(
+            message="Booking cancelled. Tap the mic to start again.",
+            next_step="idle",
+        )
+
     if step == "asking_destination":
         locations = search_location(user_message)
-
         if not locations:
             return ChatResponse(
                 message="Sorry, I couldn't find that in Bengaluru. Please try again.",
@@ -119,7 +131,6 @@ def process_message(session_id: str, user_message: str) -> ChatResponse:
 
         session["locations"] = locations
         session["step"] = "confirming_destination"
-
         top = locations[0]
         location_results = [LocationResult(**loc) for loc in locations]
 
@@ -134,12 +145,13 @@ def process_message(session_id: str, user_message: str) -> ChatResponse:
         if is_confirmation(text):
             session["selected_location"] = session["locations"][0]
             session["step"] = "asking_ride_type"
+            loc = session["selected_location"]
             return ChatResponse(
                 message="Great! Opening Rapido to check live fares.",
                 next_step="asking_ride_type",
-                selected_location=LocationResult(**session["selected_location"]),
+                selected_location=LocationResult(**loc),
             )
-        elif is_rejection(text):
+        else:
             if len(session["locations"]) > 1:
                 session["locations"].pop(0)
                 top = session["locations"][0]
@@ -156,20 +168,14 @@ def process_message(session_id: str, user_message: str) -> ChatResponse:
                     message="No more results. Please say your destination again.",
                     next_step="asking_destination",
                 )
-        else:
-            return ChatResponse(
-                message="Please say Yes to confirm or No to try another result.",
-                next_step="confirming_destination",
-            )
 
     elif step == "asking_ride_type":
         ride_type = extract_ride_type(text)
         if not ride_type:
             return ChatResponse(
-                message="I didn't catch that. Please say Bike, Scooty, or Auto.",
+                message="I didn't catch that. Please say Bike, Scooty, or Auto. Or say Cancel to stop.",
                 next_step="asking_ride_type",
             )
-
         session["ride_type"] = ride_type
         session["step"] = "confirming_booking"
         loc = session["selected_location"]
@@ -192,16 +198,11 @@ def process_message(session_id: str, user_message: str) -> ChatResponse:
                 ready_to_book=True,
                 selected_location=LocationResult(**loc),
             )
-        elif is_rejection(text):
+        else:
             clear_session(session_id)
             return ChatResponse(
                 message="Booking cancelled. Tap the mic to start again.",
                 next_step="idle",
-            )
-        else:
-            return ChatResponse(
-                message="Please say Yes to book or No to cancel.",
-                next_step="confirming_booking",
             )
 
     return ChatResponse(
